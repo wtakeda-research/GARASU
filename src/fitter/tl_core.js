@@ -1,6 +1,23 @@
 /* ============================================================
    TL model core — direct port of TL_model.py (Takeda & Lucas, JCP 160, 174504 (2024))
    Units: temperature in K (or any consistent unit as long as Tg, T are same), time in s.
+
+   Index convention
+     In run() and snapshot() (which have a time axis):
+     i  — time step along the thermal history (0 … n−1): T[i], t[i], Tf[i], tau[i], ...
+     k  — domain (0 … N−1, N = 200 by default).
+     In buildDistribution() and weightsX() (no time axis) the loop index i runs over domains, as in the paper.
+     Every per-domain array holds one value per domain:
+            Tvi[k]   local Vogel temperature T_v,i (fixed; set by buildDistribution)
+            Yi[k]    domain weight W_i, so that <T_f> = Σ_k Yi[k]·Tfi[k]
+            Tfi[k]   local fictive temperature T_f,i (the state variable that is integrated)
+            taui[k]  local relaxation time τ_i at the current step
+            Xi[k]    weight of ln τ_i in the relaxation-time spectrum, X_i (paper Eq. 22)
+          (The paper writes the domain index as i; in run() i is taken by the time step, so the domain is k there.)
+   A "domain" is one node of the G(ln τ) distribution read from the f library: node k sits at
+   ln(τ_k(T_g)/100 s) = x[k], which fixes T_v,k = T_g / (1 + D / ln(τ_k(T_g)/τ0)). Domains have no
+   geometry or neighbour coupling; they interact only through the shared <T_f>, which enters every
+   local clock τ_k (paper Eq. 18, following Richert) and the weights X_k.
    ============================================================ */
 const TL = (function () {
   const LN10 = Math.log(10);
@@ -17,6 +34,7 @@ const TL = (function () {
   function setLibrary(lib) { LIB = lib; }
 
   // Build the Tv,i / Yi distribution (calculation_of_Tf, lines 110-135)
+  // (loop index i = domain / node of G; no time axis here)
   function buildDistribution(p) {
     const { Tg, m, log10tau0, f } = p; const N = p.N || 200;
     const tau0 = Math.pow(10, log10tau0);
@@ -55,6 +73,7 @@ const TL = (function () {
   }
 
   // Xi (normalised weights of ln tau) for temperature T and average fictive temperature Tf
+  // (here i = domain; Tf is the macroscopic <T_f>, the same for every domain)
   function weightsX(dist, T, Tf, out) {
     const { N, Yi, Tv, D } = dist; out = out || new Float64Array(N);
     let s = 0; const c = 1 - Tv / Tf;
@@ -90,21 +109,22 @@ const TL = (function () {
     sigLnTau[0] = varOf(Xi, lnT);
     if (store) store.set(Tfi, 0);
 
-    for (let i = 1; i < n; i++) {
-      const dt = t[i] - t[i - 1], Ti = T[i], Tfprev = Tf[i - 1];
+    for (let i = 1; i < n; i++) {                       // i = time step
+      const dt = t[i] - t[i - 1], Ti = T[i], Tfprev = Tf[i - 1];   // Tfprev = macroscopic <T_f> from step i−1
       tauEq[i] = AG(Ti, Tv, tau0, D, Ti);
       let ax = 0;
       weightsX(dist, Ti, Tfprev, Xi);
-      for (let k = 0; k < N; k++) {
+      for (let k = 0; k < N; k++) {                     // k = domain
+        // local clock (Eq. 18): only T_v,k is domain-specific; the nonlinearity uses the shared <T_f>, not T_f,k
         taui[k] = AG(Ti, Tvi[k], tau0, D, Tfprev);
-        const Tloc = localTf(Tvi[k], Ti, Tv);
-        Tfi[k] = Tloc - (Tloc - Tfi[k]) * Math.exp(-Math.pow(dt / taui[k], beta0));
+        const Tloc = localTf(Tvi[k], Ti, Tv);           // equilibrium target of domain k at T: T(2 − T_v,k/<T_v>)
+        Tfi[k] = Tloc - (Tloc - Tfi[k]) * Math.exp(-Math.pow(dt / taui[k], beta0));   // per-step relaxation of T_f,k (Eq. 17)
         ax += Xi[k] * Math.log(taui[k]);
         lnT[k] = Math.log(taui[k]);
       }
-      tau[i] = Math.exp(ax);
+      tau[i] = Math.exp(ax);                            // X-weighted geometric-mean τ at step i
       let s = 0; for (let k = 0; k < N; k++) s += Yi[k] * Tfi[k];
-      Tf[i] = s;
+      Tf[i] = s;                                        // <T_f> at step i = Σ_k W_k T_f,k; C_p,norm = d<T_f>/dT
       sigTf[i] = varOf(Yi, Tfi);
       sigLnTau[i] = varOf(Xi, lnT);
       if (store) store.set(Tfi, i * N);
@@ -113,6 +133,7 @@ const TL = (function () {
   }
 
   // ---- snapshot at step i: distributions + beta_KWW (paper Eq. 20 and KWW fit) ----
+  // i = time step to inspect; inside, k = domain
   function snapshot(res, i) {
     const { dist, T, Tf, TfiAll, p } = res; const { N, tau0, D, Tvi, Yi } = dist;
     const Ti = T[i];
